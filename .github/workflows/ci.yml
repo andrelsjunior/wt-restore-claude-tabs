@@ -37,7 +37,7 @@ jobs:
         run: shellcheck bin/wt-restore-claude-tabs install.sh tests/run.sh
 
       - name: Test
-        run: bats --print-output-on-failure tests/
+        run: bats tests/
 
       - name: Help and version work
         run: |
