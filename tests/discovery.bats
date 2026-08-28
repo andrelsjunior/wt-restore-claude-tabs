@@ -94,3 +94,38 @@ teardown() { teardown_sandbox; }
   run "$SCRIPT" --limit 2
   [ "$(grep -c '^[ =-][0-9]' <<< "$output")" -eq 2 ]
 }
+
+@test "a newline in the session name does not create a ghost row" {
+  make_session "aaaaaaaa-1111-2222-3333-444444444444" "${SANDBOX}/work" 3 "" "$(printf 'line one\nline two')"
+  run "$SCRIPT"
+  [ "$status" -eq 0 ]
+  [ "$(grep -c '^[ =-][0-9]' <<< "$output")" -eq 1 ]
+  [[ "$output" == *"line one line two"* ]]
+  [[ "$output" != *"invalid date"* ]]
+}
+
+@test "a newline in the session name does not open an extra tab" {
+  make_session "aaaaaaaa-1111-2222-3333-444444444444" "${SANDBOX}/work" 3 "" "$(printf 'line one\nline two')"
+  run "$SCRIPT" --go
+  [ "$(tab_count)" -eq 1 ]
+}
+
+@test "escape sequences are stripped from the tab name" {
+  make_session "aaaaaaaa-1111-2222-3333-444444444444" "${SANDBOX}/work" 3 "" "$(printf 'red\033[31malert')"
+  run "$SCRIPT" --go
+  [ "$(tab_count)" -eq 1 ]
+  # the escape byte is gone, the printable leftovers are harmless
+  ! grep -qP '\x1b' "${WT_CALLS}"
+  grep -q "alert" "${WT_CALLS}"
+}
+
+@test "a very long session name is truncated" {
+  local long
+  long=$(printf 'x%.0s' $(seq 1 300))
+  make_session "aaaaaaaa-1111-2222-3333-444444444444" "${SANDBOX}/work" 3 "" "$long"
+  run "$SCRIPT" --go
+  [ "$(tab_count)" -eq 1 ]
+  local title
+  title=$(grep -A1 -- '--title' "${WT_CALLS}" | tail -1)
+  [ "${#title}" -le 80 ]
+}

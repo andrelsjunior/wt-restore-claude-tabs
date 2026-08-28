@@ -92,3 +92,29 @@ tab_count() {
   fi
   grep -c '^new-tab$' "${WT_CALLS}"
 }
+
+# Fake `claude` and a fake login shell, so tab-runner mode can be executed in a
+# test without hanging on a real interactive shell.
+setup_fake_tab_binaries() {
+  cat > "${SANDBOX}/bin/claude" <<'FAKECLAUDE'
+#!/usr/bin/env bash
+echo "claude-called: $*"
+echo "claude-cwd: $(pwd)"
+FAKECLAUDE
+  chmod +x "${SANDBOX}/bin/claude"
+
+  cat > "${SANDBOX}/bin/fake-login-shell" <<'FAKESHELL'
+#!/usr/bin/env bash
+echo "login-shell: $*"
+FAKESHELL
+  chmod +x "${SANDBOX}/bin/fake-login-shell"
+  export SHELL="${SANDBOX}/bin/fake-login-shell"
+}
+
+# Pretend a session is already running, by building a fake /proc entry.
+fake_running_session() {
+  local sid="$1" pid="${2:-4242}"
+  export WT_PROC_DIR="${SANDBOX}/proc"
+  mkdir -p "${WT_PROC_DIR}/${pid}"
+  printf 'claude\0--resume\0%s\0' "$sid" > "${WT_PROC_DIR}/${pid}/cmdline"
+}

@@ -57,6 +57,8 @@ cd wt-restore-claude-tabs
 `install.sh` symlinks `bin/wt-restore-claude-tabs` into `~/.local/bin`. To install
 somewhere else, run `PREFIX=/usr/local ./install.sh`.
 
+To remove it, run `./install.sh --uninstall`.
+
 You can also just copy the single file, it has no dependencies beyond bash,
 python3 and coreutils.
 
@@ -186,8 +188,21 @@ through the script itself.
 tests/run.sh          # shellcheck + bats
 ```
 
-The suite builds a throwaway session history and a fake `wt.exe` that records its
-arguments, so nothing real is opened while testing.
+61 tests, green on Ubuntu 22.04 and 24.04. The suite builds a throwaway session
+history, a fake `wt.exe` that records its arguments, a fake `claude` and a fake
+login shell, so nothing real is opened while testing and it runs on plain Linux
+without WSL.
+
+These environment variables exist so the tests can drive the script, and they are
+useful for debugging too:
+
+| Variable | Default | What it does |
+| -------- | ------- | ------------ |
+| `CLAUDE_PROJECTS_DIR` | `~/.claude/projects` | where to read session history from |
+| `WT_SETTINGS` | detected | path to the Windows Terminal `settings.json` |
+| `WT_BIN` | `wt.exe` | the Windows Terminal binary to call |
+| `WT_PROC_DIR` | `/proc` | where to look for running sessions |
+| `WSL_DISTRO_NAME` | `Ubuntu` | distro passed to `wsl.exe` |
 
 ## License
 
