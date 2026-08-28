@@ -110,3 +110,69 @@ teardown() { teardown_sandbox; }
   [ "$status" -eq 1 ]
   [[ "$output" == *"not found in PATH"* ]]
 }
+
+@test "a session that is already running is skipped" {
+  make_session "aaaaaaaa-1111-2222-3333-444444444444" "${SANDBOX}/work" 3 "Running"
+  make_session "bbbbbbbb-1111-2222-3333-444444444444" "${SANDBOX}/other" 3 "Closed"
+  fake_running_session "aaaaaaaa-1111-2222-3333-444444444444"
+  run "$SCRIPT" --go
+  [ "$(tab_count)" -eq 1 ]
+  [[ "$output" == *"already open (1 skipped"* ]]
+  grep -q "bbbbbbbb-1111-2222-3333-444444444444" "${WT_CALLS}"
+  ! grep -q "aaaaaaaa-1111-2222-3333-444444444444" "${WT_CALLS}"
+}
+
+@test "--no-skip-open opens it anyway" {
+  make_session "aaaaaaaa-1111-2222-3333-444444444444" "${SANDBOX}/work" 3 "Running"
+  fake_running_session "aaaaaaaa-1111-2222-3333-444444444444"
+  run "$SCRIPT" --no-skip-open --go
+  [ "$(tab_count)" -eq 1 ]
+  [[ "$output" != *"already open"* ]]
+  grep -q "aaaaaaaa-1111-2222-3333-444444444444" "${WT_CALLS}"
+}
+
+@test "an unrelated claude process does not hide a session" {
+  make_session "aaaaaaaa-1111-2222-3333-444444444444" "${SANDBOX}/work" 3 "Mine"
+  fake_running_session "99999999-9999-9999-9999-999999999999"
+  run "$SCRIPT" --go
+  [ "$(tab_count)" -eq 1 ]
+  [[ "$output" != *"already open"* ]]
+}
+
+@test "--action continue is passed to the runner" {
+  make_session "aaaaaaaa-1111-2222-3333-444444444444" "${SANDBOX}/work" 3 "Continue"
+  run "$SCRIPT" --action continue --go
+  grep -q "'continue'" "${WT_CALLS}"
+}
+
+# These run the generated payload for real, which is the only way to prove the
+# quoting survives the trip through `bash -lc`.
+
+@test "a directory with a space in it lands in the right place" {
+  setup_fake_tab_binaries
+  make_session "aaaaaaaa-1111-2222-3333-444444444444" "${SANDBOX}/my work dir" 3 "Spaces"
+  run "$SCRIPT" --go
+  [ "$(tab_count)" -eq 1 ]
+  payload=$(tail -1 "${WT_CALLS}")
+  run bash -c "$payload"
+  [[ "$output" == *"claude-cwd: ${SANDBOX}/my work dir"* ]]
+}
+
+@test "a directory with a quote in it lands in the right place" {
+  setup_fake_tab_binaries
+  make_session "aaaaaaaa-1111-2222-3333-444444444444" "${SANDBOX}/it's here" 3 "Quote"
+  run "$SCRIPT" --go
+  [ "$(tab_count)" -eq 1 ]
+  payload=$(tail -1 "${WT_CALLS}")
+  run bash -c "$payload"
+  [[ "$output" == *"claude-cwd: ${SANDBOX}/it's here"* ]]
+}
+
+@test "the payload passes the session id through untouched" {
+  setup_fake_tab_binaries
+  make_session "aaaaaaaa-1111-2222-3333-444444444444" "${SANDBOX}/work" 3 "Ids"
+  run "$SCRIPT" --go
+  payload=$(tail -1 "${WT_CALLS}")
+  run bash -c "$payload"
+  [[ "$output" == *"claude-called: --resume aaaaaaaa-1111-2222-3333-444444444444"* ]]
+}

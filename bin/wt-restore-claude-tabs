@@ -12,11 +12,12 @@
 
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.0.1"
 
 PROJECTS_DIR="${CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}"
 DISTRO="${WSL_DISTRO_NAME:-Ubuntu}"
 WT_BIN="${WT_BIN:-wt.exe}"
+PROC_DIR="${WT_PROC_DIR:-/proc}"   # overridable so the process scan can be tested
 SELF=$(readlink -f "$0")
 
 # --tab-runner is the internal mode that runs INSIDE each new tab. It keeps ';'
@@ -119,6 +120,7 @@ ENVIRONMENT
   CLAUDE_PROJECTS_DIR  session history (default: ~/.claude/projects)
   WT_SETTINGS          path to the Windows Terminal settings.json
   WT_BIN               Windows Terminal binary (default: wt.exe)
+  WT_PROC_DIR          where to look for running sessions (default: /proc)
   WSL_DISTRO_NAME      distro passed to wsl.exe (default: Ubuntu)
 HELPTEXT
 }
@@ -214,7 +216,7 @@ normalize_since() {
 # does not expose the id, so detection is partial by design.
 open_session_ids() {
   local proc cmdline
-  for proc in /proc/[0-9]*; do
+  for proc in "${PROC_DIR}"/[0-9]*; do
     [ -r "$proc/cmdline" ] || continue
     cmdline=$(tr '\0' ' ' < "$proc/cmdline" 2>/dev/null) || continue
     case "$cmdline" in
@@ -358,8 +360,17 @@ if mode == 'dir':                       # newest session of each directory only
 
 
 def clean(value):
+    # Collapse every kind of whitespace. A newline in a session name would break
+    # the TSV contract with the shell and show up as a second, garbage row.
+    value = ' '.join(value.split())
+    # Drop control characters. A session name is attacker-controlled in the sense
+    # that anything you paste into a chat can end up here, and an escape sequence
+    # would be interpreted by the terminal.
+    value = ''.join(ch for ch in value if ord(ch) >= 32 and ord(ch) != 127)
     # ';' would split the wt command line into extra tabs
-    return value.replace('\t', ' ').replace('"', "'").replace(';', ',')
+    value = value.replace('"', "'").replace(';', ',')
+    # a very long name is not useful as a tab title and bloats the command line
+    return value[:80]
 
 
 for mtime, cwd, session_id, turns, tab, origin in rows[:limit]:
