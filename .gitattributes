@@ -1,0 +1,4 @@
+* text=auto eol=lf
+bin/wt-restore-claude-tabs text eol=lf
+*.bats text eol=lf
+*.sh text eol=lf

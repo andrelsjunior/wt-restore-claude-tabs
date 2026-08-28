@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: shellcheck + bats (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck and bats
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck bats
+
+      - name: Versions
+        run: |
+          bash --version | head -1
+          python3 --version
+          shellcheck --version | grep version:
+          bats --version
+
+      - name: Lint
+        run: shellcheck bin/wt-restore-claude-tabs install.sh tests/run.sh
+
+      - name: Test
+        run: bats --print-output-on-failure tests/
+
+      - name: Help and version work
+        run: |
+          ./bin/wt-restore-claude-tabs --help > /dev/null
+          ./bin/wt-restore-claude-tabs --version

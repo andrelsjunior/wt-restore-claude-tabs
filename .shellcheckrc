@@ -1,0 +1,2 @@
+# bats files are sourced by the bats runner, not run standalone
+external-sources=true

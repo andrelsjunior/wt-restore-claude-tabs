@@ -1,0 +1,463 @@
+#!/usr/bin/env bash
+# wt-restore-claude-tabs - reopen Claude Code tabs in Windows Terminal after a
+# reboot, a crash, or an accidental close.
+#
+# Windows Terminal only brings tabs back when "firstWindowPreference" was set to
+# "persistedWindowLayout" BEFORE the window closed. If it was not, there is
+# nothing to undo. This script works around that: it rebuilds the tabs from the
+# Claude Code session history in ~/.claude/projects/*/<uuid>.jsonl, which holds
+# the working directory, the session id and the session name.
+#
+# Home: https://github.com/andrelsjunior/wt-restore-claude-tabs
+
+set -euo pipefail
+
+VERSION="1.0.0"
+
+PROJECTS_DIR="${CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}"
+DISTRO="${WSL_DISTRO_NAME:-Ubuntu}"
+WT_BIN="${WT_BIN:-wt.exe}"
+SELF=$(readlink -f "$0")
+
+# --tab-runner is the internal mode that runs INSIDE each new tab. It keeps ';'
+# out of the wt.exe command line, which splits on ';' even inside quotes.
+# It sits at the top on purpose: it runs once per tab, so nothing costly first.
+if [ "${1:-}" = "--tab-runner" ]; then
+  shift
+  run_dir="${1:-$HOME}"; run_action="${2:-shell}"; run_sid="${3:-}"
+
+  # The tab starts already inside the project directory, so direnv would load
+  # .envrc during zsh startup, and powerlevel10k warns on any console output at
+  # that point. Silencing only the direnv log fixes it; the .envrc variables are
+  # still exported.
+  export DIRENV_LOG_FORMAT=""
+
+  cd "$run_dir" 2>/dev/null || echo "warning: directory not found: $run_dir" >&2
+
+  claude_bin=$(command -v claude 2>/dev/null || true)
+  if [ -z "$claude_bin" ] && [ -x "$HOME/.local/bin/claude" ]; then
+    claude_bin="$HOME/.local/bin/claude"
+  fi
+
+  if [ -n "$claude_bin" ]; then
+    case "$run_action" in
+      resume)   "$claude_bin" --resume "$run_sid" || true ;;
+      continue) "$claude_bin" --continue || true ;;
+    esac
+  elif [ "$run_action" != shell ]; then
+    echo "claude was not found in this tab's PATH" >&2
+  fi
+
+  # Drop into YOUR login shell, not a generic bash.
+  login_shell="${SHELL:-}"
+  if [ ! -x "$login_shell" ]; then
+    login_shell=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7)
+  fi
+  [ -x "$login_shell" ] || login_shell=/bin/bash
+  exec "$login_shell" -l
+fi
+
+LIMIT=30
+SINCE="7d"
+MODE=session        # session = one tab per session | dir = one tab per directory
+ACTION=resume       # resume | continue | shell
+EXCLUDE='observer-sessions'
+MIN_TURNS=2
+WINDOW=new          # new | 0 (current window) | <name>
+PROFILE=""          # empty = detect the Windows Terminal default profile
+ONLY=""             # e.g. "1,3,5" - open only those numbers from the list
+GREP=""             # only sessions that mention this text
+SKIP_OPEN=1         # skip sessions that are already running
+VERBOSE=0
+GO=0
+
+usage() {
+  cat <<'HELPTEXT'
+wt-restore-claude-tabs - reopen Claude Code tabs in Windows Terminal
+
+USAGE
+  wt-restore-claude-tabs                   # dry run: only list what it would do
+  wt-restore-claude-tabs --go              # actually open the tabs
+  wt-restore-claude-tabs --only 2,5 --go   # open only items 2 and 5
+  wt-restore-claude-tabs -g "auth bug"     # only sessions that talked about it
+
+OPTIONS
+  -n, --limit N        maximum number of tabs (default: 30)
+  -s, --since SPEC     time window (default: 7d). Short form: 30m, 6h, 7d, 2w.
+                       7d covers tabs left open and untouched for days. Shorter
+                       windows miss an open tab you have not typed in recently.
+                       Also accepts "2 days ago" or "2026-08-27 18:00".
+  -m, --mode MODE      session = one tab per session (default)
+                       dir     = one tab per directory, newest session only
+  -a, --action ACTION  resume  = claude --resume <id> (default)
+                       continue= claude --continue
+                       shell   = only open the shell in the directory
+  -o, --only LIST      open only these numbers from the listing (e.g. 1,3,5)
+  -g, --grep TEXT      only sessions where this text shows up in the conversation
+                       (searches what you and Claude wrote, skips tool output,
+                        case insensitive)
+  -x, --exclude REGEX  drop paths matching this (default: observer-sessions)
+      --min-turns N    ignore sessions with fewer than N messages (default: 2)
+  -w, --window W       new = new window (default) | 0 = current window | <name>
+  -p, --profile NAME   Windows Terminal profile (default: the one in settings.json)
+      --no-skip-open   do not skip sessions that are already open
+  -v, --verbose        print the full wt.exe command line
+      --enable-persistence
+                       set firstWindowPreference=persistedWindowLayout in the
+                       Windows Terminal settings.json (with a backup), so next
+                       time Windows Terminal restores the tabs on its own
+      --go             actually run it (without this it is always a dry run)
+  -V, --version        print the version
+  -h, --help           this help
+
+TAB NAME
+  1. the name you gave the session with /rename   (marked * in the listing)
+  2. the name Claude generated                    (marked ~)
+  3. the first prompt of the conversation         (no mark)
+
+ENVIRONMENT
+  CLAUDE_PROJECTS_DIR  session history (default: ~/.claude/projects)
+  WT_SETTINGS          path to the Windows Terminal settings.json
+  WT_BIN               Windows Terminal binary (default: wt.exe)
+  WSL_DISTRO_NAME      distro passed to wsl.exe (default: Ubuntu)
+HELPTEXT
+}
+
+# Path to the Windows Terminal settings.json. Resolved only when needed, because
+# figuring out the Windows user name costs one interop call.
+wt_settings_path() {
+  if [ -n "${WT_SETTINGS:-}" ]; then echo "$WT_SETTINGS"; return; fi
+  local winuser
+  winuser=$(cmd.exe /c 'echo %USERNAME%' 2>/dev/null | tr -d '\r\n') || true
+  [ -n "$winuser" ] || winuser="$USER"
+  echo "/mnt/c/Users/${winuser}/AppData/Local/Packages/Microsoft.WindowsTerminal_8wekyb3d8bbwe/LocalState/settings.json"
+}
+
+enable_persistence() {
+  local settings bak
+  settings=$(wt_settings_path)
+  [ -f "$settings" ] || { echo "settings.json not found at: $settings" >&2; exit 1; }
+  bak="${settings}.bak.$(date +%Y%m%d%H%M%S)"
+  cp "$settings" "$bak"
+  python3 - "$settings" <<'PYPERSIST'
+import json, sys
+path = sys.argv[1]
+with open(path, encoding='utf-8-sig') as fh:
+    data = json.load(fh)
+data['firstWindowPreference'] = 'persistedWindowLayout'
+with open(path, 'w', encoding='utf-8') as fh:
+    json.dump(data, fh, indent=4, ensure_ascii=False)
+PYPERSIST
+  echo "firstWindowPreference = persistedWindowLayout"
+  echo "backup: $bak"
+  echo "Close and reopen Windows Terminal for it to take effect."
+}
+
+# every option that takes a value goes through this, so the script does not die
+# with "unbound variable"
+need_val() {
+  [ $# -ge 2 ] && [ -n "$2" ] || { echo "option $1 needs a value" >&2; exit 2; }
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -n|--limit)   need_val "$1" "${2:-}"; LIMIT="$2"; shift 2 ;;
+    -s|--since)   need_val "$1" "${2:-}"; SINCE="$2"; shift 2 ;;
+    -m|--mode)    need_val "$1" "${2:-}"; MODE="$2"; shift 2 ;;
+    -a|--action)  need_val "$1" "${2:-}"; ACTION="$2"; shift 2 ;;
+    -o|--only)    need_val "$1" "${2:-}"; ONLY="$2"; shift 2 ;;
+    -g|--grep)    need_val "$1" "${2:-}"; GREP="$2"; shift 2 ;;
+    -x|--exclude) need_val "$1" "${2:-}"; EXCLUDE="$2"; shift 2 ;;
+    --min-turns)  need_val "$1" "${2:-}"; MIN_TURNS="$2"; shift 2 ;;
+    -w|--window)  need_val "$1" "${2:-}"; WINDOW="$2"; shift 2 ;;
+    -p|--profile) need_val "$1" "${2:-}"; PROFILE="$2"; shift 2 ;;
+    --no-skip-open) SKIP_OPEN=0; shift ;;
+    -v|--verbose) VERBOSE=1; shift ;;
+    --enable-persistence) enable_persistence; exit 0 ;;
+    --go)         GO=1; shift ;;
+    -V|--version) echo "wt-restore-claude-tabs $VERSION"; exit 0 ;;
+    -h|--help)    usage; exit 0 ;;
+    *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+# validate early, before walking the history
+case "$MODE"   in session|dir) ;; *) echo "invalid --mode: $MODE (use session or dir)" >&2; exit 2 ;; esac
+case "$ACTION" in resume|continue|shell) ;; *) echo "invalid --action: $ACTION (use resume, continue or shell)" >&2; exit 2 ;; esac
+case "$LIMIT"     in ''|*[!0-9]*) echo "--limit must be a number: $LIMIT" >&2; exit 2 ;; esac
+case "$MIN_TURNS" in ''|*[!0-9]*) echo "--min-turns must be a number: $MIN_TURNS" >&2; exit 2 ;; esac
+if [ -n "$ONLY" ]; then
+  case "$ONLY" in *[!0-9,\ ]*) echo "--only takes numbers separated by commas: $ONLY" >&2; exit 2 ;; esac
+fi
+
+# Accepts the short form (30m, 6h, 7d, 2w) on top of the `date -d` format.
+normalize_since() {
+  local value="$1"
+  if [[ "$value" =~ ^([0-9]+)[[:space:]]*([mhdwMHDW])$ ]]; then
+    local num="${BASH_REMATCH[1]}"
+    case "${BASH_REMATCH[2]}" in
+      m|M) echo "${num} minutes ago" ;;
+      h|H) echo "${num} hours ago" ;;
+      d|D) echo "${num} days ago" ;;
+      w|W) echo "${num} weeks ago" ;;
+    esac
+  else
+    echo "$value"
+  fi
+}
+
+# Session ids that already have a claude process running. This only catches the
+# ones started with `claude --resume <id>`; a session resumed from inside the TUI
+# does not expose the id, so detection is partial by design.
+open_session_ids() {
+  local proc cmdline
+  for proc in /proc/[0-9]*; do
+    [ -r "$proc/cmdline" ] || continue
+    cmdline=$(tr '\0' ' ' < "$proc/cmdline" 2>/dev/null) || continue
+    case "$cmdline" in
+      *claude*--resume*)
+        printf '%s\n' "$cmdline" | grep -oE '[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}' || true
+        ;;
+    esac
+  done | sort -u
+}
+
+command -v "$WT_BIN" >/dev/null 2>&1 || { echo "$WT_BIN not found in PATH (running outside WSL?)" >&2; exit 1; }
+[ -d "$PROJECTS_DIR" ] || { echo "no session history at $PROJECTS_DIR" >&2; exit 1; }
+
+SINCE_SPEC=$(normalize_since "$SINCE")
+SINCE_EPOCH=$(date -d "$SINCE_SPEC" +%s 2>/dev/null) || {
+  echo "invalid --since: $SINCE (try 6h, 7d, 2w)" >&2; exit 2; }
+
+# TSV: epoch \t cwd \t session_id \t turns \t tab_name \t name_origin
+SESSIONS=$(python3 - "$PROJECTS_DIR" "$SINCE_EPOCH" "$MODE" "$EXCLUDE" "$MIN_TURNS" "$LIMIT" "$GREP" <<'PYSESSIONS'
+import glob
+import json
+import os
+import re
+import sys
+
+root, since, mode, exclude, min_turns, limit = sys.argv[1:7]
+needle = (sys.argv[7] if len(sys.argv) > 7 else '').lower()
+since, min_turns, limit = float(since), int(min_turns), int(limit)
+exclude_re = re.compile(exclude) if exclude else None
+
+
+def text_of(record):
+    """Plain text of a message, ignoring tool calls and tool results."""
+    content = record.get('message', {}).get('content')
+    if isinstance(content, list):
+        content = ' '.join(
+            part.get('text', '') for part in content
+            if isinstance(part, dict) and part.get('type') == 'text'
+        )
+    return content if isinstance(content, str) else ''
+
+
+def summarize(path):
+    """Read the jsonl and return (cwd, turns, title, custom, ai, hit).
+
+    Reads line by line and parses only the lines that matter, so a session with
+    thousands of messages costs little.
+    """
+    cwd = title = custom = ai = None
+    turns = 0
+    hit = not needle
+
+    with open(path, encoding='utf-8', errors='replace') as handle:
+        for line in handle:
+            # the name you gave the session, and the one Claude generated
+            if '"custom-title"' in line or '"ai-title"' in line:
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                if record.get('type') == 'custom-title' and record.get('customTitle'):
+                    custom = record['customTitle']      # last one wins
+                elif record.get('type') == 'ai-title' and record.get('aiTitle'):
+                    ai = record['aiTitle']
+                continue
+
+            if needle and not hit and '"type":"assistant"' in line:
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                if not record.get('isSidechain') and needle in text_of(record).lower():
+                    hit = True
+                continue
+
+            if '"cwd"' not in line and '"type":"user"' not in line and '"type": "user"' not in line:
+                continue
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+
+            if cwd is None and record.get('cwd'):
+                cwd = record['cwd']
+            if record.get('type') != 'user' or record.get('isSidechain'):
+                continue
+
+            turns += 1
+            body = text_of(record)
+            if not hit and needle in body.lower():
+                hit = True
+            if title is None and body:
+                clean_body = ' '.join(re.sub(r'<[^>]+>.*?</[^>]+>', ' ', body, flags=re.S).split())
+                # skip slash commands, hooks and system notices
+                if clean_body and not clean_body.startswith(('/', '<', 'Caveat:')):
+                    title = clean_body[:45]
+
+    return cwd, turns, title, custom, ai, hit
+
+
+rows = []
+# one level deep on purpose: it skips subagents/agent-*.jsonl, which are not tabs
+for path in glob.glob(os.path.join(root, '*', '*.jsonl')):
+    try:
+        mtime = os.stat(path).st_mtime
+    except OSError:
+        continue
+    if mtime < since:
+        continue
+    if exclude_re and exclude_re.search(path):
+        continue
+
+    cwd, turns, title, custom, ai, hit = summarize(path)
+    if not hit or not cwd or turns < min_turns:
+        continue
+    if not os.path.isdir(cwd):          # directory is gone (removed worktree, etc.)
+        continue
+    if exclude_re and exclude_re.search(cwd):
+        continue
+
+    session_id = os.path.splitext(os.path.basename(path))[0]
+    label = os.path.basename(cwd) or cwd
+    if custom:
+        tab, origin = custom, '*'
+    elif ai:
+        tab, origin = ai, '~'
+    else:
+        tab, origin = (title or label), ' '
+    rows.append((mtime, cwd, session_id, turns, tab, origin))
+
+rows.sort(key=lambda row: -row[0])
+
+if mode == 'dir':                       # newest session of each directory only
+    seen, deduped = set(), []
+    for row in rows:
+        if row[1] in seen:
+            continue
+        seen.add(row[1])
+        deduped.append(row)
+    rows = deduped
+
+
+def clean(value):
+    # ';' would split the wt command line into extra tabs
+    return value.replace('\t', ' ').replace('"', "'").replace(';', ',')
+
+
+for mtime, cwd, session_id, turns, tab, origin in rows[:limit]:
+    print(u"%d\t%s\t%s\t%d\t%s\t%s" % (int(mtime), cwd, session_id, turns, clean(tab), origin))
+PYSESSIONS
+)
+
+if [ -z "$SESSIONS" ]; then
+  if [ -n "$GREP" ]; then
+    echo "No session mentioning \"$GREP\" in the last $SINCE."
+    echo "Try another term, or widen it: $(basename "$0") -g '$GREP' --since 14d"
+  else
+    echo "No session found in the last $SINCE."
+    echo "Try widening it: $(basename "$0") --since 14d"
+  fi
+  exit 0
+fi
+
+# Profile: without --profile, use the default profile from the WT settings.json.
+# Without it Windows Terminal opens the tab with a generic look (like a cmd tab).
+if [ -z "$PROFILE" ]; then
+  wt_settings=$(wt_settings_path)
+  if [ -f "$wt_settings" ]; then
+    PROFILE=$(python3 - "$wt_settings" <<'PYPROFILE' || true
+import json, sys
+with open(sys.argv[1], encoding='utf-8-sig') as fh:
+    data = json.load(fh)
+default = data.get('defaultProfile')
+for profile in data.get('profiles', {}).get('list', []):
+    if profile.get('guid') == default:
+        print(profile.get('name', ''))
+        break
+PYPROFILE
+)
+  fi
+fi
+
+OPEN_IDS=""
+if [ "$SKIP_OPEN" -eq 1 ]; then
+  OPEN_IDS=$(open_session_ids || true)
+fi
+
+WT_ARGS=( -w "$WINDOW" )
+first=1
+idx=0        # number shown in the listing
+opening=0    # how many tabs will actually open
+skipped_open=0
+
+header="window: $SINCE (since $(date -d "@$SINCE_EPOCH" '+%d/%m %H:%M'))"
+[ -n "$GREP" ] && header="$header  |  conversations mentioning: \"$GREP\""
+echo "$header"
+printf '%-4s %-12s  %-4s  %-30s  %s\n' '#' 'LAST USED' 'MSG' 'DIRECTORY' 'TAB NAME  (* yours / ~ generated)'
+
+while IFS=$'\t' read -r mtime cwd session_id turns tab_title origin; do
+  idx=$((idx + 1))
+
+  take=1
+  if [ -n "$ONLY" ]; then
+    case ",${ONLY// /}," in *",${idx},"*) take=1 ;; *) take=0 ;; esac
+  fi
+
+  mark=" "
+  if [ -n "$OPEN_IDS" ] && printf '%s\n' "$OPEN_IDS" | grep -qxF "$session_id"; then
+    take=0; mark="="; skipped_open=$((skipped_open + 1))
+  elif [ "$take" -eq 0 ]; then
+    mark="-"
+  fi
+
+  printf '%s%-3s %-12s  %-4s  %-30s  %s\n' \
+    "$mark" "$idx" "$(date -d "@$mtime" '+%d/%m %H:%M')" "$turns" "${cwd/#$HOME/\~}" "${origin} ${tab_title}"
+
+  [ "$take" -eq 1 ] || continue
+  opening=$((opening + 1))
+
+  # Call this same script in runner mode: it does the cd, runs claude and drops
+  # into your login shell so the tab stays open when the session ends.
+  escaped_cwd=${cwd//\'/\'\\\'\'}
+  payload="'${SELF}' --tab-runner '${escaped_cwd}' '${ACTION}' '${session_id}'"
+
+  [ $first -eq 1 ] || WT_ARGS+=( ';' )
+  first=0
+  WT_ARGS+=( new-tab )
+  if [ -n "$PROFILE" ]; then WT_ARGS+=( -p "$PROFILE" ); fi
+  WT_ARGS+=( --title "$tab_title" wsl.exe -d "$DISTRO" -- bash -lc "$payload" )
+done <<< "$SESSIONS"
+
+echo
+[ "$skipped_open" -gt 0 ] && echo "= already open ($skipped_open skipped; use --no-skip-open to open anyway)"
+[ -n "$ONLY" ] && echo "- outside --only $ONLY"
+
+if [ "$opening" -eq 0 ]; then
+  echo "Nothing to open."
+  exit 0
+fi
+
+[ "$VERBOSE" -eq 1 ] && { echo; echo "Command: $WT_BIN ${WT_ARGS[*]}"; }
+
+if [ "$GO" -eq 0 ]; then
+  echo "DRY RUN - nothing was opened. Run it again with --go to open $opening tab(s)."
+  exit 0
+fi
+
+"$WT_BIN" "${WT_ARGS[@]}"
+echo "$opening tab(s) opened (window: $WINDOW, profile: ${PROFILE:-default}, action: $ACTION)."
