@@ -156,7 +156,10 @@ PYPERSIST
 # every option that takes a value goes through this, so the script does not die
 # with "unbound variable"
 need_val() {
-  [ $# -ge 2 ] && [ -n "$2" ] || { echo "option $1 needs a value" >&2; exit 2; }
+  if [ $# -lt 2 ] || [ -z "$2" ]; then
+    echo "option $1 needs a value" >&2
+    exit 2
+  fi
 }
 
 while [ $# -gt 0 ]; do
